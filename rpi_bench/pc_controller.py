@@ -48,6 +48,10 @@ DEFAULT_MODELS = [
 log = logging.getLogger("pc_controller")
 
 
+def _int_or_none(v: str) -> Optional[int]:
+    return None if v.lower() in ("none", "") else int(v)
+
+
 def safe_name(name: str) -> str:
     # Windows のファイル名に ':' は使えない (NTFS の代替データストリーム扱いになる)
     return name.replace("/", "_").replace(":", "_")
@@ -107,12 +111,14 @@ class SSHServerLauncher:
         return f"http://127.0.0.1:{self.local_port}"
 
     def sync(self) -> None:
-        """RPi 側に必要なファイル (rpi_server.py, ollama_utils.py) を scp で送る."""
+        """RPi 側サーバが使うファイルを scp で送る."""
         subprocess.run(["ssh", self.target, f"mkdir -p {self.remote_dir}/rpi_bench"], check=True)
-        files = [(REPO_ROOT / "ollama_utils.py", ""), (REPO_ROOT / "rpi_bench" / "rpi_server.py", "rpi_bench/")]
-        for src, sub in files:
-            subprocess.run(["scp", "-q", str(src), f"{self.target}:{self.remote_dir}/{sub}"], check=True)
-        log.info("Synced rpi_server.py and ollama_utils.py to %s:%s", self.target, self.remote_dir)
+        names = ["main.py", "ollama_utils.py", "system_monitor.py", "rpi_bench/rpi_server.py"]
+        subprocess.run(
+            ["scp", "-q", *[str(REPO_ROOT / n) for n in names[:-1]], f"{self.target}:{self.remote_dir}/"], check=True
+        )
+        subprocess.run(["scp", "-q", str(REPO_ROOT / names[-1]), f"{self.target}:{self.remote_dir}/rpi_bench/"], check=True)
+        log.info("Synced %s to %s:%s", ", ".join(names), self.target, self.remote_dir)
 
     def start(self, timeout_sec: float = 60.0) -> None:
         remote_cmd = (
@@ -129,11 +135,15 @@ class SSHServerLauncher:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Starting RPi server via SSH (log: %s)", self.log_path)
         self._logf = self.log_path.open("ab")
+        log_offset = self._logf.tell()
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=self._logf, stderr=subprocess.STDOUT)
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"ssh exited with code {self.proc.returncode}; see {self.log_path}")
+                with self.log_path.open("rb") as f:
+                    f.seek(log_offset)
+                    output = f.read().decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ssh exited with code {self.proc.returncode}:\n{output}")
             try:
                 requests.get(self.url + "/health", timeout=2)
                 return
@@ -181,7 +191,7 @@ def write_summary(records_path: Path, summary_path: Path, model: str, dataset: s
 
 def run_task(args, rpi: RPiClient, meter, model: str, task: Task, clock: tuple, out_dir: Path) -> Optional[dict]:
     """1 問分: 計測開始 -> プロンプト指示 -> 結果受信 -> 計測終了 -> 生データ保存 -> レコード作成."""
-    payload = {"model": model, "prompt": task.prompt, "num_predict": args.num_predict, "task_id": task.task_id}
+    payload = {"model": model, "prompt": task.prompt, "task_id": task.task_id}
     for attempt in range(1, args.max_retries + 1):
         # RPi 側・通信のエラーはリトライし、パワーメータのエラーは例外のまま中断する
         meter.start()
@@ -209,7 +219,7 @@ def run_task(args, rpi: RPiClient, meter, model: str, task: Task, clock: tuple, 
         # PC がプロンプトを送ってから結果を受け取るまで (通信を含む)
         "window": summarize(meas.samples, meas.t_start, meas.t_end),
         # RPi 上の推論区間 (RPi 時刻を時計オフセットで PC 時刻に変換)
-        "inference": summarize(meas.samples, result["rpi_start_time"] - offset, result["rpi_end_time"] - offset),
+        "inference": summarize(meas.samples, result["t_start_unix"] - offset, result["t_end_unix"] - offset),
         "clock_offset_sec": offset,
         "clock_rtt_sec": rtt,
         "raw_file": None,
@@ -239,7 +249,7 @@ def main():
     conn.add_argument("--rpi_url", help="Already running rpi_server.py (e.g. http://192.168.0.10:8000).")
     parser.add_argument("--ssh_remote_dir", default="~/llm_ptme", help="Repository directory on RPi.")
     parser.add_argument("--ssh_python", default="python3", help="Python on RPi (e.g. ~/venv/bin/python).")
-    parser.add_argument("--ssh_sync", action="store_true", help="Copy rpi_server.py and ollama_utils.py by scp.")
+    parser.add_argument("--ssh_sync", action="store_true", help="Copy rpi_server.py and its imports by scp.")
     parser.add_argument("--rpi_port", type=int, default=8000, help="rpi_server.py port on RPi (--ssh).")
     parser.add_argument("--local_port", type=int, default=18000, help="Local forwarded port on PC (--ssh).")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
@@ -247,7 +257,13 @@ def main():
     parser.add_argument("--scenario", default="RPi", help="Label used in the output path.")
     parser.add_argument("--output_dir", default=str(REPO_ROOT / "results_rpi"))
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of problems per dataset.")
+    # 以下 5 つは main.py と同じ意味・既定値
     parser.add_argument("--num_predict", type=int, default=512)
+    parser.add_argument("--num_ctx", type=int, default=4096)
+    parser.add_argument("--num_thread", type=_int_or_none, default=None, help="Default: Ollama's choice.")
+    parser.add_argument("--num_gpu", type=_int_or_none, default=0, help="0 = CPU only, 'none' = Ollama's choice.")
+    parser.add_argument("--think", choices=["auto", "true", "false"], default="auto")
+    parser.add_argument("--keep_alive", default="60m")
     parser.add_argument("--idle_sec", type=float, default=5.0, help="Idle time after each problem.")
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--request_timeout", type=float, default=3600.0, help="Timeout [s] for RPi requests.")
@@ -287,6 +303,13 @@ def main():
 
 
 def run(args) -> None:
+    options = {"temperature": 0.0, "num_predict": args.num_predict, "num_ctx": args.num_ctx}
+    if args.num_gpu is not None:
+        options["num_gpu"] = args.num_gpu
+    if args.num_thread is not None:
+        options["num_thread"] = args.num_thread
+    prepare_params = {"options": options, "think": args.think, "keep_alive": args.keep_alive}
+
     rpi = RPiClient(args.rpi_url, args.request_timeout)
     log.info("RPi: %s", rpi.get("/health"))
 
@@ -324,7 +347,7 @@ def run(args) -> None:
                 continue
 
             log.info("========== %s ==========", model)
-            log.info("Prepare: %s", rpi.post("/prepare", {"model": model}))
+            log.info("Prepare: %s", rpi.post("/prepare", {"model": model, **prepare_params}))
             log.info("Check: %s", rpi.post("/check", {"model": model}))
             clock = rpi.clock_offset()
             log.info("Clock offset (RPi - PC): %.4f s (RTT %.4f s)", *clock)

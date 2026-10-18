@@ -26,7 +26,7 @@ RPi の消費電力を FNIRSI USB パワーメータ (`../fnirsi-usb-power-data-
 | `pc_controller.py` | PC | 全体の制御 (上表の PC 側) |
 | `power_meter.py` | PC | パワーメータの計測。`fnirsi_logger.py` のデバイス処理を再利用 |
 | `bench_tasks.py` | PC | 問題の読み込み・プロンプト生成・採点 (`scripts/test_*.py` と同一) |
-| `rpi_server.py` | RPi | Ollama 操作。推論は既存の `ollama_utils.call_ollama_generate_with_memory` を使用 |
+| `rpi_server.py` | RPi | Ollama 操作。ロード・推論・計測は `main.py` と同じ関数 (`ollama_utils`, `system_monitor`) を使用 |
 
 ## セットアップ
 
@@ -66,7 +66,7 @@ python rpi_bench/pc_controller.py --ssh pi@raspberrypi.local --ssh_python ~/venv
     --models tinyllama:1.1b --datasets gsm8k --max_samples 2 --idle_sec 1
 ```
 
-- `--ssh_sync`: 起動前に `rpi_server.py` と `ollama_utils.py` を scp で RPi に送る (PC 側で編集した場合など)
+- `--ssh_sync`: 起動前に `rpi_server.py` と、それが使う `main.py` / `ollama_utils.py` / `system_monitor.py` を scp で RPi に送る (PC 側で編集した場合など)
 - `--no_meter`: パワーメータなしで通信フローだけ確認する
 - `--keep_model`: モデルごとの終了時にモデルを削除しない
 
@@ -81,7 +81,8 @@ PC で `--rpi_url http://<RPiのIP>:8000` を指定する (認証なしなので
 | `--datasets` | human_eval gsm8k mmlu-pro |
 | `--gsm8k_selected_idx_file` | `scripts/gsm8k_selected_idx.txt` (`none` で全問) |
 | `--mmlu_pro_selected_ids_file` | `scripts/mmlu_pro_selected_ids_20.txt` (`none` で全問) |
-| `--num_predict` | 512 |
+| `--num_predict` / `--num_ctx` / `--num_gpu` / `--num_thread` | 512 / 4096 / 0 (CPU のみ) / Ollama 任せ (`main.py` と同じ) |
+| `--think` / `--keep_alive` | auto / 60m (`main.py` と同じ) |
 | `--idle_sec` | 5 (各問題後の待機) |
 | `--scenario` / `--output_dir` | `RPi` / `results_rpi` |
 
@@ -105,9 +106,10 @@ results_rpi/<scenario>/
 ```jsonc
 {
   "scenario": "RPi", "dataset": "gsm8k", "task_id": "gsm8k/1", "model": "tinyllama:1.1b",
-  "completion": "...", "finish_reason": "stop", "prompt_tokens": 56, "completion_tokens": 120,
-  "ttft": 1.2, "rss_baseline_bytes": ..., "rss_peak_bytes": ..., "rss_final_bytes": ...,
-  "rpi_start_time": ..., "rpi_end_time": ..., "latency_sec": 8.3,      // RPi 上の推論区間
+  "completion": "...", "thinking": "", "done_reason": "stop", "prompt_tokens": 56, "completion_tokens": 120,
+  "t_start_unix": ..., "t_end_unix": ..., "latency_sec": 8.3, "ttft_sec": 1.2,   // RPi 上の推論区間 (chat_generate)
+  "total_duration_ns": ..., "load_duration_ns": ..., "eval_duration_ns": ...,  // Ollama 内部時間
+  "rss_peak_bytes": ..., "cpu_temp_max_c": ..., "cpu_freq_mean_mhz": ..., "throttled_end": "0x0",  // ResourceMonitor
   "question": "...", "gold_answer": "5", "pred_answer": "5", "correct": true,
   "pc_start_time": ..., "pc_end_time": ...,                            // PC 上の計測区間
   "energy": {

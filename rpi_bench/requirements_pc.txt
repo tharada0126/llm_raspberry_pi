@@ -2,5 +2,5 @@ requests
 datasets
 pyusb
 crc
-# Windows で libusb-1.0.dll が見つからない場合
+# provides libusb-1.0.dll on Windows
 libusb-package; sys_platform == "win32"

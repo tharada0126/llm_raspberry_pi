@@ -31,20 +31,33 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from ollama import Client  # noqa: E402
 
-from ollama_utils import call_ollama_generate_with_memory  # noqa: E402
+# 推論・ロード・計測は main.py (RPi 単体実行) と同じ関数を使う
+from main import WARMUP_PROMPT, resolve_think  # noqa: E402
+from ollama_utils import (  # noqa: E402
+    chat_generate,
+    describe_model,
+    load_model,
+    ollama_version,
+    unload_all_models,
+    unload_model,
+)
+from system_monitor import ResourceMonitor, read_device_model  # noqa: E402
 
-# ollama_utils.call_ollama_generate は localhost:11434 固定なので合わせる
-OLLAMA_URL = "http://localhost:11434"
-CHECK_PROMPT = "Hello, this is a warm-up prompt to initialize the model."
+OLLAMA_URL = "http://127.0.0.1:11434"
 
 log = logging.getLogger("rpi_server")
 
 
 class OllamaManager:
-    def __init__(self, serve_log: str):
+    def __init__(self, serve_log: str, poll_sec: float):
         self.client = Client(host=OLLAMA_URL)
         self.serve_log = serve_log
         self.serve_proc = None
+        self.monitor = ResourceMonitor(poll_interval_sec=poll_sec)
+        # /prepare で決まる実行設定 (main.py の options / think / keep_alive と同じ)
+        self.options: dict = {}
+        self.think = None
+        self.keep_alive = "60m"
 
     def is_up(self) -> bool:
         try:
@@ -90,55 +103,67 @@ class OllamaManager:
                 last_status = status
         pull_sec = time.time() - t0
 
-        # 空プロンプトの generate でモデルをメモリにロードする
+        # 他のモデルが常駐していない状態から、推論と同じ options でロードする
+        unloaded = unload_all_models(self.client)
+        self.options = req.get("options") or {}
+        self.keep_alive = req.get("keep_alive", "60m")
+        self.think = resolve_think(self.client, model, req.get("think", "auto"))
         t1 = time.time()
-        self.client.generate(model=model, prompt="")
+        load_model(self.client, model, self.options, keep_alive=self.keep_alive)
         load_sec = time.time() - t1
-        log.info("Prepared %s (pull %.1fs, load %.1fs)", model, pull_sec, load_sec)
-        return {"model": model, "pull_sec": pull_sec, "load_sec": load_sec}
+        log.info("Prepared %s (pull %.1fs, load %.1fs, options %s, think %s)",
+                 model, pull_sec, load_sec, self.options, self.think)  # fmt: skip
+        try:
+            model_info = describe_model(self.client, model)
+        except Exception as e:
+            model_info = {"error": str(e)}
+        return {
+            "model": model,
+            "pull_sec": pull_sec,
+            "load_sec": load_sec,
+            "unloaded_models": unloaded,
+            "options": self.options,
+            "think": self.think,
+            "keep_alive": self.keep_alive,
+            "model_info": model_info,
+            "hostname": socket.gethostname(),
+            "device_model": read_device_model(),
+            "ollama_version": ollama_version(),
+        }
 
     def check(self, req: dict) -> dict:
         model = req["model"]
-        completion, _, ttft = call_ollama_generate_with_memory(
-            model=model, prompt=req.get("prompt") or CHECK_PROMPT, num_predict=req.get("num_predict", 32)
-        )
-        text = completion.choices[0].message.content or ""
-        if not text.strip():
+        result = chat_generate(
+            self.client, model, WARMUP_PROMPT, {**self.options, "num_predict": 32},
+            think=self.think, keep_alive=self.keep_alive,
+        )  # fmt: skip
+        if not (result.content or result.thinking).strip():
             raise RuntimeError("Empty response from model")
-        return {"model": model, "completion": text, "ttft": ttft}
+        return {"model": model, "completion": result.content, "ttft_sec": result.ttft_sec}
 
     def generate(self, req: dict) -> dict:
         model = req["model"]
-        t_start = time.time()
-        completion, rss_trace, ttft = call_ollama_generate_with_memory(
-            model=model,
-            prompt=req["prompt"],
-            system=req.get("system"),
-            num_predict=req.get("num_predict", 512),
-        )
-        t_end = time.time()
-        usage = completion.usage
+        self.monitor.start()
+        result = chat_generate(
+            self.client, model, req["prompt"], self.options, system=req.get("system"),
+            think=self.think, keep_alive=self.keep_alive,
+        )  # fmt: skip
+        resource = self.monitor.stop()
         return {
             "task_id": req.get("task_id"),
             "model": model,
-            "hostname": socket.gethostname(),
-            "completion": completion.choices[0].message.content or "",
-            "finish_reason": completion.choices[0].finish_reason,
-            "prompt_tokens": usage.prompt_tokens if usage else None,
-            "completion_tokens": usage.completion_tokens if usage else None,
-            "ttft": ttft,
-            "rss_baseline_bytes": rss_trace.baseline_rss,
-            "rss_peak_bytes": rss_trace.peak_rss,
-            "rss_final_bytes": rss_trace.final_rss,
-            "rpi_start_time": t_start,
-            "rpi_end_time": t_end,
-            "latency_sec": t_end - t_start,
+            "completion": result.content,
+            "thinking": result.thinking,
+            # t_start_unix / t_end_unix / latency_sec / ttft_sec / tokens / Ollama 内部時間
+            **result.profile_fields(),
+            # メモリ・CPU 温度・周波数・スロットリング
+            **resource,
         }
 
     def finish(self, req: dict) -> dict:
         model = req["model"]
         try:
-            self.client.generate(model=model, prompt="", keep_alive=0)  # unload
+            unload_model(self.client, model)
         except Exception as e:
             log.warning("Unload of %s failed: %s", model, e)
         self.client.delete(model)
@@ -197,12 +222,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Use 0.0.0.0 to accept direct (non-SSH) connections.")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--serve_log", default="/tmp/ollama_serve.log", help="Log file when this server starts ollama.")
+    parser.add_argument("--poll_sec", type=float, default=0.1, help="Resource polling interval during inference.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    mgr = OllamaManager(serve_log=args.serve_log)
+    mgr = OllamaManager(serve_log=args.serve_log, poll_sec=args.poll_sec)
     mgr.ensure_serve()
 
     # SSH 切断 (SIGHUP) や kill (SIGTERM) でも finally で ollama serve を止める
