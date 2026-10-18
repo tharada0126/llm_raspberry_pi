@@ -1,0 +1,4 @@
+ollama
+psutil
+# ollama_utils.py が import している (未使用だが import 時に必要)
+openai
