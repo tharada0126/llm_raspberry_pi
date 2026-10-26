@@ -61,7 +61,7 @@ def process_jsonl(input_file: str, output_file: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract code from JSONL file.")
-    parser.add_argument("--input_file", type=str, required=True, help="Path to the input *_samples.jsonl file.")
+    parser.add_argument("--input_file", type=str, required=True, help="Path to the input *_records.jsonl file.")
     parser.add_argument("--output_file", type=str, default=None, help="Default: <input>_extracted.jsonl")
     args = parser.parse_args()
 

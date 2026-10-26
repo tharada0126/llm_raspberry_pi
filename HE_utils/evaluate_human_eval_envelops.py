@@ -16,6 +16,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("results_dir", nargs="?", default="results/rpi", help="e.g. results/rpi")
 parser.add_argument("--n_workers", type=int, default=4)
 parser.add_argument("--timeout", type=float, default=3.0)
+parser.add_argument(
+    "--problem_file",
+    default=str(Path(__file__).resolve().parent / "HumanEval.jsonl.gz"),
+    help="HumanEval problems (the pip-installed human-eval package does not ship this file)",
+)
 args = parser.parse_args()
 
 summary = []
@@ -28,7 +33,8 @@ for sample_file in sample_files:
     print(f"\n=== Evaluating {dir_name}: {sample_file} ===")
     try:
         results = evaluate_functional_correctness(
-            str(sample_file), k=[1], n_workers=args.n_workers, timeout=args.timeout
+            str(sample_file), k=[1], n_workers=args.n_workers, timeout=args.timeout,
+            problem_file=args.problem_file,
         )
         pass_at_1 = float(results["pass@1"])
         print(f"{dir_name} results: pass@1={pass_at_1:.4f}")

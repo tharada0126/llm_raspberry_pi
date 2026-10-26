@@ -12,7 +12,6 @@ from __future__ import annotations
 import atexit
 import gzip
 import logging
-import os
 import sys
 import threading
 import time
@@ -45,17 +44,36 @@ class Measurement:
     samples: List[Sample] = field(default_factory=list)
 
 
-def _add_libusb_to_path() -> None:
-    """Windows で libusb-package が入っていれば、その libusb-1.0.dll を pyusb から見えるようにする."""
-    if os.name != "nt":
-        return
+def _load_libusb() -> None:
+    """libusb-package が入っていれば、同梱の libusb-1.0 (dll/dylib/so) を pyusb に読み込ませる.
+
+    pyusb は一度読み込んだ libusb を使い回すので、以降の usb.core.find() (fnirsi_logger 内) もこれを使う。
+    Windows / macOS では libusb を別途インストールしなくて済む。
+    """
     try:
         import libusb_package
     except ImportError:
         return
-    lib = libusb_package.get_library_path()
-    if lib is not None:
-        os.environ["PATH"] = str(Path(lib).parent) + os.pathsep + os.environ.get("PATH", "")
+    libusb_package.get_libusb1_backend()
+
+
+class _HidEndpoint:
+    """hidapi のデバイスを pyusb のエンドポイントと同じ write() / read() で使えるようにする."""
+
+    def __init__(self, dev):
+        self._dev = dev
+
+    def write(self, data: bytes) -> int:
+        # 先頭 1 バイトはレポート ID (このデバイスはレポート ID なしなので 0)
+        return self._dev.write(b"\x00" + bytes(data))
+
+    def read(self, size_or_buffer: int, timeout: int):
+        import usb.core
+
+        data = self._dev.read(size_or_buffer, timeout)
+        if not data:
+            raise usb.core.USBTimeoutError("Operation timed out")
+        return data
 
 
 class FnirsiPowerMeter:
@@ -75,9 +93,7 @@ class FnirsiPowerMeter:
         self._crc = None
 
     def open(self) -> None:
-        _add_libusb_to_path()
         sys.path.insert(0, str(self.logger_dir))
-        import usb.util
         import fnirsi_logger as fl
 
         if self.use_crc:
@@ -86,20 +102,10 @@ class FnirsiPowerMeter:
             except Exception as e:
                 log.warning("CRC check disabled: %s", e)
 
-        dev, self._is_fnb58_or_fnb48s = fl.find_device()
-        if dev is None:
-            raise RuntimeError("FNIRSI power meter not found (check USB connection / WinUSB driver).")
-        dev.reset()
-        interface_hid_num = fl.find_hid_interface_num(dev)
-        dev.set_configuration()
-        intf = dev.get_active_configuration()[(interface_hid_num, 0)]
-        self._ep_out = usb.util.find_descriptor(
-            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-        )
-        self._ep_in = usb.util.find_descriptor(
-            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-        )
-        assert self._ep_in and self._ep_out
+        if sys.platform == "darwin":
+            self._ep_out = self._ep_in = self._open_hid(fl)
+        else:
+            self._ep_out, self._ep_in = self._open_usb(fl)
 
         fl.request_data(self._is_fnb58_or_fnb48s, self._ep_out)
         time.sleep(0.1)
@@ -116,6 +122,52 @@ class FnirsiPowerMeter:
                 raise RuntimeError("No data received from FNIRSI power meter.")
             time.sleep(0.05)
         log.info("FNIRSI power meter ready (%s)", "FNB58/FNB48S" if self._is_fnb58_or_fnb48s else "FNB48/C1")
+
+    def _open_usb(self, fl):
+        """Windows / Linux: pyusb (libusb) で HID インターフェースのエンドポイントを直接使う."""
+        _load_libusb()
+        import usb.util
+
+        dev, self._is_fnb58_or_fnb48s = fl.find_device()
+        if dev is None:
+            raise RuntimeError("FNIRSI power meter not found (check USB connection / WinUSB driver).")
+        dev.reset()
+        interface_hid_num = fl.find_hid_interface_num(dev)
+        dev.set_configuration()
+        intf = dev.get_active_configuration()[(interface_hid_num, 0)]
+        ep_out = usb.util.find_descriptor(
+            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+        )
+        ep_in = usb.util.find_descriptor(
+            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+        )
+        assert ep_in and ep_out
+        return ep_out, ep_in
+
+    def _open_hid(self, fl) -> "_HidEndpoint":
+        """macOS: カーネルの HID ドライバがインターフェースを掴んでいて libusb から claim できないため hidapi を使う."""
+        import hid
+
+        candidates = [
+            (fl.VID, fl.PID_FNB48, False),
+            (fl.VID, fl.PID_C1, False),
+            (fl.VID_FNB58, fl.PID_FNB58, True),
+            (fl.VID_FNB48S, fl.PID_FNB48S, True),
+        ]
+        for vid, pid, is_fnb58_or_fnb48s in candidates:
+            if hid.enumerate(vid, pid):
+                dev = hid.device()
+                try:
+                    dev.open(vid, pid)
+                except OSError as e:
+                    # macOS の hidapi は排他オープンなので、他プロセスが開いていると失敗する
+                    raise RuntimeError(
+                        "Could not open FNIRSI power meter. Another process may be using it "
+                        "(previous run still alive?); otherwise unplug and replug the meter."
+                    ) from e
+                self._is_fnb58_or_fnb48s = is_fnb58_or_fnb48s
+                return _HidEndpoint(dev)
+        raise RuntimeError("FNIRSI power meter not found (check USB connection).")
 
     def close(self) -> None:
         if self._thread is not None:
