@@ -5,6 +5,10 @@
 USB 接続は実験全体で開いたままにし、受信スレッドが常時データを読み続ける。
 start() から stop() までに受信したサンプルを 1 回の計測として返す。
 
+エネルギー予算 (budget_controller.py): start(budget_J=...) を指定すると、受信スレッドが
+サンプルを受け取るたびにエネルギーを積算し、予算に達した時点で on_budget を呼ぶ
+(推論の打ち切りを、次のトークンを待たずに即座に行うため)。
+
 Python 3.9 互換.
 """
 from __future__ import annotations
@@ -42,6 +46,81 @@ class Measurement:
     t_start: float
     t_end: float
     samples: List[Sample] = field(default_factory=list)
+    # start(budget_J=...) で予算に達した場合: {"t_sample", "t_fired", "energy_J"} (それ以外は None)
+    budget_hit: Optional[dict] = None
+
+
+class _BudgetAccumulator:
+    """start() から stop() までのエネルギーを受信のたびに積算し、予算到達で on_budget を呼ぶ.
+
+    サブクラスは __init__ で _init_accumulator() を呼び、サンプル受信時に _feed() を呼ぶ。
+    積算は fnirsi_logger の energy_Ws と同じく sum((V*I - baseline_W) * dt)。
+    """
+
+    def _init_accumulator(self) -> None:
+        self._lock = threading.Lock()
+        self._recording = False
+        self._buf: List[Sample] = []
+        self._t_start = 0.0
+        self._last_t: Optional[float] = None
+        self._budget_J: Optional[float] = None
+        self._baseline_W = 0.0
+        self._on_budget = None
+        self._acc_J = 0.0
+        self._budget_hit: Optional[dict] = None
+
+    @property
+    def energy_J(self) -> float:
+        """start() からの積算エネルギー [J] (baseline_W を差し引いた値)."""
+        with self._lock:
+            return self._acc_J
+
+    def _begin(self, budget_J: Optional[float], baseline_W: float, on_budget) -> float:
+        with self._lock:
+            self._buf = []
+            self._t_start = time.time()
+            self._recording = True
+            self._budget_J = budget_J
+            self._baseline_W = baseline_W
+            self._on_budget = on_budget
+            self._acc_J = 0.0
+            self._budget_hit = None
+        return self._t_start
+
+    def disarm(self) -> None:
+        """予算の監視だけを止める (計測は stop() まで続く). 生成終了後の tail 区間で on_budget を呼ばないため."""
+        with self._lock:
+            self._budget_J = None
+            self._on_budget = None
+
+    def _feed(self, samples: List[Sample]) -> None:
+        fire = None
+        with self._lock:
+            if self._recording:
+                self._buf.extend(samples)
+                for s in samples:
+                    if s.t < self._t_start:  # start() 直後に届いたパケットの、start() より前のサンプル
+                        continue
+                    self._acc_J += (s.voltage * s.current - self._baseline_W) * INTERVAL
+                    if self._budget_J is not None and self._budget_hit is None and self._acc_J >= self._budget_J:
+                        self._budget_hit = {"t_sample": s.t, "t_fired": time.time(), "energy_J": self._acc_J}
+                        fire = (self._on_budget, dict(self._budget_hit))
+            self._last_t = samples[-1].t
+        if fire is not None and fire[0] is not None:
+            try:
+                fire[0](fire[1])  # ロックの外で呼ぶ (打ち切り処理は短時間で終わること)
+            except Exception as e:
+                log.warning("on_budget callback failed: %s", e)
+
+    def _end(self, t_end: float) -> Measurement:
+        with self._lock:
+            self._recording = False
+            samples, self._buf = self._buf, []
+            t_start = self._t_start
+            hit, self._budget_hit = self._budget_hit, None
+            self._on_budget = None
+            self._budget_J = None
+        return Measurement(t_start, t_end, [s for s in samples if t_start <= s.t <= t_end], hit)
 
 
 def _load_libusb() -> None:
@@ -76,20 +155,16 @@ class _HidEndpoint:
         return data
 
 
-class FnirsiPowerMeter:
+class FnirsiPowerMeter(_BudgetAccumulator):
     enabled = True
 
     def __init__(self, logger_dir: str, use_crc: bool = False):
         self.logger_dir = Path(logger_dir).resolve()
         self.use_crc = use_crc
-        self._lock = threading.Lock()
+        self._init_accumulator()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[BaseException] = None
-        self._recording = False
-        self._buf: List[Sample] = []
-        self._t_start = 0.0
-        self._last_t: Optional[float] = None
         self._crc = None
 
     def open(self) -> None:
@@ -175,13 +250,10 @@ class FnirsiPowerMeter:
             self._thread.join(timeout=15)
             self._thread = None
 
-    def start(self) -> float:
+    def start(self, budget_J: Optional[float] = None, baseline_W: float = 0.0, on_budget=None) -> float:
+        """計測開始. budget_J を指定すると、積算エネルギーが達した時点で on_budget(hit) を受信スレッドから呼ぶ."""
         self._check_error()
-        with self._lock:
-            self._buf = []
-            self._t_start = time.time()
-            self._recording = True
-        return self._t_start
+        return self._begin(budget_J, baseline_W, on_budget)
 
     def stop(self) -> Measurement:
         t_end = time.time()
@@ -192,12 +264,9 @@ class FnirsiPowerMeter:
                 if self._last_t is not None and self._last_t >= t_end:
                     break
             time.sleep(0.01)
-        with self._lock:
-            self._recording = False
-            samples, self._buf = self._buf, []
-            t_start = self._t_start
+        meas = self._end(t_end)
         self._check_error()
-        return Measurement(t_start, t_end, [s for s in samples if t_start <= s.t <= t_end])
+        return meas
 
     def _check_error(self) -> None:
         if self._error is not None:
@@ -236,10 +305,7 @@ class FnirsiPowerMeter:
             while not self._stop_evt.is_set():
                 samples = self._parse(self._ep_in.read(size_or_buffer=64, timeout=5000))
                 if samples:
-                    with self._lock:
-                        if self._recording:
-                            self._buf.extend(samples)
-                        self._last_t = samples[-1].t
+                    self._feed(samples)
                 if time.time() >= next_keepalive:
                     next_keepalive = time.time() + refresh
                     self._ep_out.write(KEEPALIVE)
@@ -267,12 +333,54 @@ class NullPowerMeter:
     def close(self) -> None:
         pass
 
-    def start(self) -> float:
+    def start(self, budget_J: Optional[float] = None, baseline_W: float = 0.0, on_budget=None) -> float:
         self._t_start = time.time()
         return self._t_start
 
     def stop(self) -> Measurement:
         return Measurement(self._t_start, time.time())
+
+
+class SimulatedPowerMeter(_BudgetAccumulator):
+    """--simulate_power_W 用。一定電力のサンプルを 100 sps で生成する (メータなしで打ち切り処理を確認する).
+
+    記録されるエネルギーは実測ではないので、本番の計測には使わない。
+    """
+
+    enabled = True
+    simulated = True
+
+    def __init__(self, power_W: float, voltage_V: float = 5.0):
+        self.power_W = power_W
+        self.voltage_V = voltage_V
+        self._init_accumulator()
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def open(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="simulated-meter", daemon=True)
+        self._thread.start()
+        log.warning("Using SIMULATED power meter (%.2f W constant); energies are not measured.", self.power_W)
+
+    def close(self) -> None:
+        if self._thread is not None:
+            self._stop_evt.set()
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def start(self, budget_J: Optional[float] = None, baseline_W: float = 0.0, on_budget=None) -> float:
+        return self._begin(budget_J, baseline_W, on_budget)
+
+    def stop(self) -> Measurement:
+        t_end = time.time()
+        time.sleep(0.05)  # 実機と同様に t_end 以降のパケットを待つ
+        return self._end(t_end)
+
+    def _run(self) -> None:
+        current = self.power_W / self.voltage_V
+        while not self._stop_evt.wait(4 * INTERVAL):  # 実機と同じく 4 サンプル / パケット
+            t0 = time.time() - 4 * INTERVAL
+            self._feed([Sample(t0 + i * INTERVAL, i, self.voltage_V, current, 0.0, 0.0, 25.0) for i in range(4)])
 
 
 def summarize(samples: List[Sample], t_start: float, t_end: float) -> dict:

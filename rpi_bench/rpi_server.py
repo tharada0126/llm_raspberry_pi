@@ -9,6 +9,9 @@ PC (pc_controller.py) からの HTTP/JSON 指示を受けて Ollama を操作す
   POST /check     : 動作確認 (短いプロンプトで Ollama 実行)
   POST /generate  : ベンチマークのプロンプトで Ollama 実行し、結果を 1 つの JSON で返す
   POST /finish    : 終了指示 (モデルのアンロードと削除)
+  POST /monitor_start, /monitor_stop
+                  : 資源計測 (メモリ・温度・周波数) のみ開始/終了。budget_controller.py 用。
+                    推論は PC が SSH ポートフォワード経由で Ollama に直接送り、途中で接続を切って打ち切る。
 
 リクエストは 1 件ずつ逐次処理する (HTTPServer はシングルスレッド)。
 認証は無いので、通常は pc_controller.py --ssh で起動し、127.0.0.1 で待ち受けて
@@ -160,6 +163,14 @@ class OllamaManager:
             **resource,
         }
 
+    def monitor_start(self, req: dict) -> dict:
+        self.monitor.start()
+        return {"t_unix": time.time()}
+
+    def monitor_stop(self, req: dict) -> dict:
+        resource = self.monitor.stop()
+        return {"t_unix": time.time(), **resource}
+
     def finish(self, req: dict) -> dict:
         model = req["model"]
         try:
@@ -177,6 +188,8 @@ def make_handler(mgr: OllamaManager):
         "/check": mgr.check,
         "/generate": mgr.generate,
         "/finish": mgr.finish,
+        "/monitor_start": mgr.monitor_start,
+        "/monitor_stop": mgr.monitor_stop,
     }
 
     class Handler(BaseHTTPRequestHandler):

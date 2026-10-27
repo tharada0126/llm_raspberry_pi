@@ -97,8 +97,19 @@ class SSHServerLauncher:
     ssh は -tt で疑似端末を確保するので、ssh を終了すると RPi 側サーバも SIGHUP で終了する。
     """
 
-    def __init__(self, target: str, remote_dir: str, python: str, remote_port: int, local_port: int, log_path: Path):
+    def __init__(
+        self,
+        target: str,
+        remote_dir: str,
+        python: str,
+        remote_port: int,
+        local_port: int,
+        log_path: Path,
+        extra_forwards: Optional[list] = None,
+    ):
         self.target = target
+        # 追加のポートフォワード [(PC 側ポート, RPi 側ポート), ...] (budget_controller.py が Ollama 用に使う)
+        self.extra_forwards = extra_forwards or []
         self.remote_dir = remote_dir
         self.python = python
         self.remote_port = remote_port
@@ -130,6 +141,7 @@ class SSHServerLauncher:
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30",
             "-L", f"{self.local_port}:127.0.0.1:{self.remote_port}",
+            *[a for lp, rp in self.extra_forwards for a in ("-L", f"{lp}:127.0.0.1:{rp}")],
             self.target, remote_cmd,
         ]  # fmt: skip
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

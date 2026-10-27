@@ -133,3 +133,92 @@ results_rpi/<scenario>/
   `fnirsi_logger` README の TODO 参照)。メータのデータ用 USB を抜き差しする。
   `pc_controller.py` は終了時 (Ctrl+C を含む) に必ずメータのバッファを読み切ってから閉じる。
 - `ssh exited with code 255`: `rpi_server.log` に ssh のエラーが出る。鍵認証・ホスト名を確認する。
+
+## エネルギー予算で打ち切る実験 (`budget_controller.py`)
+
+1 問ごとにエネルギーの上限 (予算) を決め、RPi の消費エネルギーが予算に達した時点で推論を打ち切って
+PTME (Precision / Time / Memory / Energy) を記録する。構成 (PC・メータ・RPi のつなぎ方) は上と同じ。
+
+| | `pc_controller.py` | `budget_controller.py` |
+|---|---|---|
+| 推論の送り先 | rpi_server `/generate` (RPi 内で最後まで生成) | RPi の Ollama `/api/chat` に PC からストリーミングで直接送る (SSH ポートフォワード) |
+| 打ち切り | なし | メータのサンプル受信ごとに積算し、予算に達した瞬間に Ollama との接続を切る |
+| メモリ・温度 | `/generate` 内で計測 | rpi_server `/monitor_start`, `/monitor_stop` |
+
+- 予算はプロンプト送信からの積算エネルギーで、プロンプト処理 (prefill) を含む。モデルのロードは含まない。
+- 接続を切ると Ollama は生成を中止する。トークンを待たずに切るので、prefill 中でも打ち切れる。
+  打ち切り後も `--tail_sec` (3 s) 計測を続け、電力が待機電力に戻ったことを確認する (戻らなければ警告)。
+- 打ち切った出力も、これまでと同じ規則で採点する (GSM8K は `####` が無ければ最後の数値を答えとみなす)。
+- `rpi_server.py` に `/monitor_start`, `/monitor_stop` を追加したので、**初回は `--ssh_sync` を付けて RPi に送る**。
+
+```bash
+# 動作確認 (メータの代わりに 5 W 一定の模擬メータ。打ち切りの流れだけ確認する)
+python rpi_bench/budget_controller.py --ssh pi@raspberrypi.local --ssh_python ~/venv/bin/python --ssh_sync \
+    --simulate_power_W 5 --models tinyllama:1.1b --datasets gsm8k --max_samples 2 --budgets 10 inf --scenario BudgetTest
+
+# 本番: 論文と同じ 6 モデル x 3 データセット、100 J ごとに 500 J まで
+python rpi_bench/budget_controller.py --ssh pi@raspberrypi.local --ssh_python ~/venv/bin/python \
+    --budgets 100 200 300 400 500
+```
+
+主なオプション:
+
+| オプション | 既定値 | 内容 |
+|---|---|---|
+| `--budgets` | 100 200 300 400 500 | 1 問あたりの予算 [J]。`inf` で予算なし (参照用) |
+| `--budget_basis` | gross | gross: メータの値そのまま。net: 待機電力を差し引いた分だけを予算に数える |
+| `--idle_power_W` / `--baseline_sec` | なし / 20 | net の待機電力。指定が無ければモデルごとに (ロード済みの状態で) 計測する |
+| `--order` | task | task: 1 問を全予算で続けて実行 (途中で止めても予算間で問題がそろう)。budget: 予算ごとに全問 |
+| `--tail_sec` / `--tail_warn_W` | 3 / 1.0 | 打ち切り後の計測時間 / 待機電力 + これを超えたら警告 |
+| `--simulate_power_W` | なし | 模擬メータ (計測値は実測ではない。テスト専用) |
+
+その他 (`--models`, `--datasets`, `--num_predict` など) は `pc_controller.py` と同じ。中断しても再実行で再開する。
+
+### 出力
+
+```
+results_rpi/Budget/
+├── run_meta.jsonl                                  # モデルごとの設定・待機電力・時計オフセット
+├── budget_ptme.csv                                 # budget_summary.py の出力
+└── B100J/<dataset>/<model>/                        # 予算ごと (inf は Binf)
+    ├── <dataset>_<model>_records.jsonl             # 1 問 1 行
+    ├── <dataset>_<model>_summary.json
+    ├── energy_raw/<task_id>.txt.gz                 # 送信〜tail 終了までの電力の生データ
+    └── trace/<task_id>.json.gz                     # 受信したトークン列と受信時刻 (送信からの秒)
+```
+
+レコードは pc_controller.py の項目に次を加えたもの:
+
+- `status`: `budget_exhausted` (打ち切り) / `completed` (予算内で終了)
+- `latency_sec`: プロンプト送信 → 打ち切り (または結果受信) の PC 時刻。`completion_tokens` は打ち切り時は受信チャンク数
+- `energy.window_basis_J`: 予算と同じ基準の区間エネルギー。`energy.window` は gross の区間情報
+- `energy.budget_hit` / `cancel_delay_sec` / `overshoot_J`: 予算到達の検出時刻・打ち切りまでの遅れ・予算の超過分
+- `energy.tail`, `tail_last_mean_power_W`: 打ち切り後の電力 (RPi が止まったかの確認)
+- 打ち切った場合、Ollama の内部時間・`prompt_tokens` は得られない (None)
+
+### 集計 (`budget_summary.py`)
+
+```bash
+python rpi_bench/budget_summary.py results_rpi/Budget
+```
+
+予算 × データセット × モデルごとの PTME (precision, mean_latency_sec, peak_rss_gb, mean_energy_J) と、
+打ち切り率・超過分などを `budget_ptme.csv` に出す。HumanEval は採点しないので、先に
+
+```bash
+for b in B100J B200J B300J B400J B500J; do TAG=Budget/$b bash HE_utils/run_humaneval_evaluation.sh; done
+```
+
+で評価しておくと pass@1 が入る (このスクリプトは envelope の結果も毎回評価し直すので、必要なら RPi 部分だけ実行する)。
+
+**事後導出:** temperature 0 では、同じ問題の生成は予算によらず途中まで同じになる。大きい予算 (または `inf`)
+の実行の `trace` と `energy_raw` から、小さい予算で打ち切った結果を再現できる:
+
+```bash
+python rpi_bench/budget_summary.py results_rpi/Budget --derive_from B500J --derive_budgets 50 100 150 200 250 300 400
+```
+
+導出結果は `source = derived_from_B500J` の行になり、実測の予算と重なる場合は正誤の一致率
+(`live_correct_agreement`) と時間・トークン数の差も出る。導出した HumanEval の出力は
+`Budget/derived_from_B500J/<予算>/` に書くので `TAG=Budget/derived_from_B500J/B100J` で評価できる。
+導出では、メモリは元の実行の最大値をそのまま使い、打ち切りの遅れ (`cancel_delay_sec`) は含まない。
